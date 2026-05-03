@@ -1,0 +1,6 @@
+*.curl
+.flyme-sync/
+album_*/
+*.part
+__pycache__/
+
