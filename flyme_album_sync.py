@@ -41,7 +41,17 @@ def log(message: str) -> None:
     print(message, flush=True)
 
 
-def parse_curl_file(path: Path) -> tuple[str, dict[str, str], dict[str, str]]:
+def parse_raw_form(body: str) -> dict[str, str]:
+    params: dict[str, str] = {}
+    for part in body.split("&"):
+        if not part:
+            continue
+        key, _, value = part.partition("=")
+        params[urllib.parse.unquote(key)] = urllib.parse.unquote(value)
+    return params
+
+
+def parse_curl_file(path: Path) -> tuple[str, dict[str, str], dict[str, str], str]:
     raw = path.read_text(encoding="utf-8")
     tokens = shlex.split(raw.replace("\\\n", " "))
     if not tokens or tokens[0] != "curl":
@@ -70,12 +80,12 @@ def parse_curl_file(path: Path) -> tuple[str, dict[str, str], dict[str, str]]:
     if not body:
         raise SystemExit("Could not find --data-raw body in curl file")
 
-    params = dict(urllib.parse.parse_qsl(body, keep_blank_values=True))
+    params = parse_raw_form(body)
     if "token" not in params:
         raise SystemExit("curl body does not contain token")
     if "dirId" not in params:
         raise SystemExit("curl body does not contain dirId")
-    return url, headers, params
+    return url, headers, params, body
 
 
 def form_body(params: dict[str, Any]) -> str:
@@ -105,6 +115,13 @@ def signed_body(params: dict[str, Any], token: str | None = None) -> bytes:
     return f"{form_body(body_params)}&sign={signature}".encode("utf-8")
 
 
+def reuse_curl_body(base_params: dict[str, str], offset: int, limit: int) -> bytes:
+    body_params = dict(base_params)
+    body_params["offset"] = str(offset)
+    body_params["limit"] = str(limit)
+    return form_body(body_params).encode("utf-8")
+
+
 def request_json(url: str, headers: dict[str, str], body: bytes, timeout: int = 60) -> dict[str, Any]:
     req_headers = {
         "content-type": "application/x-www-form-urlencoded",
@@ -126,6 +143,7 @@ def fetch_album_pages(
     base_params: dict[str, str],
     cache_dir: Path,
     max_pages: int | None,
+    resign: bool,
 ) -> list[dict[str, Any]]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     token = base_params["token"]
@@ -135,17 +153,24 @@ def fetch_album_pages(
     total_count: int | None = None
 
     while True:
-        page_params = {
-            key: value
-            for key, value in base_params.items()
-            if key not in ("token", "sign", "cts", "offset")
-        }
-        page_params["offset"] = str(offset)
-        page_params["limit"] = str(limit)
-        body = signed_body(page_params, token=token)
+        if resign:
+            page_params = {
+                key: value
+                for key, value in base_params.items()
+                if key not in ("token", "sign", "cts", "offset")
+            }
+            page_params["offset"] = str(offset)
+            page_params["limit"] = str(limit)
+            body = signed_body(page_params, token=token)
+        else:
+            body = reuse_curl_body(base_params, offset, limit)
         data = request_json(f"{API_BASE}/album/list", headers, body)
         if data.get("code") != 200:
-            raise SystemExit(f"album/list failed at offset={offset}: {data}")
+            mode = "re-signed" if resign else "original curl token/sign"
+            raise SystemExit(
+                f"album/list failed at offset={offset} using {mode}: {data}\n"
+                "If this is offset=0, copy a fresh album/list cURL from the logged-in browser."
+            )
 
         page_path = cache_dir / f"album-list-offset-{offset}.json"
         page_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -382,11 +407,12 @@ def main() -> None:
     parser.add_argument("--no-metadata", dest="metadata", action="store_false", help="do not write metadata")
     parser.add_argument("--dry-run", action="store_true", help="list planned operations only")
     parser.add_argument("--max-pages", type=int, help="debug limit for album/list pagination")
+    parser.add_argument("--resign", action="store_true", help="recompute cts/sign instead of reusing curl body sign")
     args = parser.parse_args()
 
-    _, headers, params = parse_curl_file(args.curl_file)
+    _, headers, params, _ = parse_curl_file(args.curl_file)
     cache_dir = args.cache_dir or (args.out / ".flyme-sync")
-    items = fetch_album_pages(headers, params, cache_dir / "pages", args.max_pages)
+    items = fetch_album_pages(headers, params, cache_dir / "pages", args.max_pages, args.resign)
     log(f"album files listed: {len(items)}")
     sync_files(
         items=items,
